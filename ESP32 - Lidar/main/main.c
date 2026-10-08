@@ -22,37 +22,59 @@
   vl53l1x_platform.c/.h (the I2C glue). This file only supplies the XSHUT
   bring-up sequence and the drive logic.
 
-  What changed compared with the previous LIDAR file:
+  Earlier changes (unchanged in this revision):
 
-  1. Range validation. Every reading is now checked with
-     VL53L1X_GetRangeStatus(). A reading whose status is not 0 ("valid")
-     is NOT used as a distance. The last good value is held for up to
-     LIDAR_MAX_BAD_READS reads in a row, after which the sensor reports
-     "clear" (MAX_DISTANCE_CM), the same way the ultrasonic version treated
-     "no echo". Before this, invalid readings (often 0) were used as real
-     distances, which made the car see phantom walls: it slowed to
-     MIN_SPEED, entered TURN, and triggered STOP/reverse.
-
+  1. Range validation. Every reading is checked with VL53L1X_GetRangeStatus().
+     A reading whose status is not 0 ("valid") is NOT used as a distance.
+     The last good value is held for up to LIDAR_MAX_BAD_READS reads in a
+     row, after which the sensor reports "clear" (MAX_DISTANCE_CM).
   2. Stuck detector uses the FRONT sensor only, and only while a real wall
-     is in view. LIDAR readings are stable to a few mm (ultrasonic ones
-     jittered by cm), so the old "all three sensors unchanged" test fired
-     constantly. A clamped front reading ("nothing ahead") can never count
-     as stuck.
-
-  3. Per-reading ESP_LOGI calls removed from the control loop (they slowed
-     the loop). Set LIDAR_DEBUG to 1 for a throttled status line instead.
-
+     is in view.
+  3. Per-reading ESP_LOGI calls removed from the control loop. Set
+     LIDAR_DEBUG to 1 for a throttled status line instead.
   4. Inter-measurement period is 25 ms (must be >= the 20 ms timing budget).
+  5. Tuning constants and turn logic follow the working AVR version. Turn
+     direction is decided per corner (see the TURN section below).
 
-  5. Logic and steering now follow the working AVR version: its tuning
-     constants (speeds, distances, PID gains, filter) and its turn logic.
-     Turn direction is NOT hardcoded and NOT learned: every corner decides
-     its own direction. When a corner starts, the wheels are held straight
-     while (right - left) is summed. The direction locks as soon as
-     |sum| >= TURN_DECIDE_THRESHOLD_CM, or after TURN_DECIDE_MS at the
-     latest, and is then kept for that corner only. The turn PID supplies
-     only the steering strength (minimum TURN_MIN_STEER_DEG); its sign is
-     not re-evaluated every loop.
+  This revision:
+
+  A. Sensor bring-up is verified (review item 5). After XSHUT is released
+     the code polls VL53L1X_BootState() instead of a fixed 2 ms wait, checks
+     the return status of every setup call, and confirms the sensor actually
+     produces a first measurement. A failed sensor is reset and retried
+     (VL53L1X_BRINGUP_ATTEMPTS). If one still fails the car refuses to drive:
+     it stops and blinks the status LED N times per second, where
+     N = 1 (left), 2 (middle), 3 (right) for the first sensor that failed.
+     Power-cycle to try again.
+
+  B. Side-sensor dropouts no longer look like open space (item 6). For
+     steering, a side sensor keeps using its last VALID reading for up to
+     LIDAR_SIDE_HOLD_READS invalid reads in a row (longer than the front
+     sensor's hold). If either side has no trustworthy value the steering PID
+     is skipped and the wheels go straight until both sides are valid again,
+     instead of steering hard toward a phantom 200 cm gap. The TURN logic
+     still sees a genuinely open side as "clear", which is what it needs to
+     pick a direction.
+
+  C. TURN steers from the first loop (item 7). The seed reading that
+     triggered the corner gives a provisional direction immediately; it can
+     still flip while evidence accumulates and locks as before
+     (TURN_DECIDE_THRESHOLD_CM / TURN_DECIDE_MS). If there is essentially no
+     evidence yet (|sum| < TURN_PROVISIONAL_MIN_CM) the wheels stay straight.
+
+  D. Stale readings are flushed (item 8). The kickstart, recovery, pause and
+     the initial start-wait all block for a long time without servicing the
+     sensors. A VL53L1X holds its last result until the interrupt is cleared,
+     so the first read afterwards used to return a value from BEFORE the
+     delay (for example the <10 cm reading that caused a recovery, which could
+     trigger another one). After any long block, lidar_flush_all() clears
+     each sensor, discards one fresh measurement, and marks the readings
+     "no data yet" until a new valid one arrives.
+
+  E. Recovery reverses for REVERSE_TIME_MS in total (item 9). The timer now
+     starts before the kickstart (so the kickstart counts toward the time),
+     and the last wiggle step is shortened to fit instead of always running a
+     full WIGGLE_HALF_PERIOD_MS.
 
   Behavior:
     DRIVE - centers between the two side boards with a PID on the
@@ -129,9 +151,20 @@
 // trips it.
 #define VL53L1X_DATA_READY_TIMEOUT_US 60000UL
 
+// Bring-up robustness.
+#define VL53L1X_BOOT_TIMEOUT_MS       100u  // max wait for the sensor firmware to boot after XSHUT goes high
+#define VL53L1X_FIRST_RANGE_TIMEOUT_MS 150u // max wait for the first measurement after StartRanging
+#define VL53L1X_BRINGUP_ATTEMPTS      3     // tries per sensor before giving up
+
 // How many consecutive invalid readings from one sensor are covered by
 // holding its last good value, before it is reported as "clear" instead.
+// (Used for the front sensor and for TURN.)
 #define LIDAR_MAX_BAD_READS 2
+
+// Side sensors, when used for STEERING, keep using their last valid reading
+// for this many invalid reads in a row (about 8 x 25-30 ms = ~200 ms). Past
+// that the steering PID is skipped rather than fed a fake "wide open" side.
+#define LIDAR_SIDE_HOLD_READS 8
 
 // ---------- LEDC (PWM) assignments ----------
 #define LEDC_MODE            LEDC_LOW_SPEED_MODE // only mode available on ESP32-S3
@@ -150,14 +183,14 @@
 #define MOTOR_LEDC_RES_BITS   LEDC_TIMER_8_BIT // 0-255 duty
 
 // ---------- Tuning constants (taken from the working AVR version) ----------
-#define MAX_DISTANCE_CM        200u    // ignore/clamp anything farther than this
+#define MAX_DISTANCE_CM        150u    // ignore/clamp anything farther than this
 #define STOP_DISTANCE_CM       10u     // genuine imminent collision - stop/reverse
-#define CORNER_SLOW_DISTANCE_CM 80u    // front wall closer than this -> start slowing
-#define CORNER_TRIGGER_DISTANCE_CM 60u // front wall closer than this -> commit to a TURN
+#define CORNER_SLOW_DISTANCE_CM 120u    // front wall closer than this -> start slowing
+#define CORNER_TRIGGER_DISTANCE_CM 80u // front wall closer than this -> commit to a TURN
 
-#define TURN_SPEED              100u    // fixed, slow speed while executing a turn
-#define TURN_DURATION_MS        600u   // how long to hold the turn through a corner - THE main knob to tune
-#define TURN_MAX_EXTRA_MS       800u   // if still blocked after TURN_DURATION_MS, keep turning up to this much longer
+#define TURN_SPEED              70u    // fixed, slow speed while executing a turn
+#define TURN_DURATION_MS        400u   // how long to hold the turn through a corner - THE main knob to tune
+#define TURN_MAX_EXTRA_MS       200u   // if still blocked after TURN_DURATION_MS, keep turning up to this much longer
 
 #define SERVO_MIN_US      1000u
 #define SERVO_MAX_US      2000u
@@ -167,8 +200,8 @@
 
 #define SERVO_INVERT      0u // servo direction non-inverted
 
-#define DRIVE_SPEED       150u    // 0-255 forward PWM speed on a clear straight
-#define MIN_SPEED         80u    // speed floor so the car doesn't stall approaching a corner
+#define DRIVE_SPEED       100u    // 0-255 forward PWM speed on a clear straight
+#define MIN_SPEED         70u    // speed floor so the car doesn't stall approaching a corner
 #define TURN_SPEED_REDUCTION 50u // max PWM cut for hard PID steering corrections on a straight
 #define REVERSE_SPEED     80u    // 0-255 reverse PWM speed used during recovery
 
@@ -176,7 +209,7 @@
 #define KICKSTART_MS       120u
 #define RECOVERY_SETTLE_MS 100u
 
-#define REVERSE_TIME_MS        600u
+#define REVERSE_TIME_MS        300u   // TOTAL time spent reversing, kickstart included
 #define WIGGLE_HALF_PERIOD_MS  200u
 
 // Stuck: the FRONT sensor must stay within STUCK_DISTANCE_DELTA_CM for this
@@ -194,6 +227,12 @@ static inline uint32_t micros(void) {
 static void delay_ms(uint32_t ms) {
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
+
+// Set whenever the code has just blocked for a long time without servicing the
+// sensors (kickstart, recovery, pause, start-wait). The main loop then calls
+// lidar_flush_all() before trusting any reading. Starts set: the bring-up and
+// start-wait happen before the first loop iteration.
+static uint8_t sensors_stale = 1;
 
 // ---------- GPIO setup ----------
 static void gpio_setup(void) {
@@ -240,38 +279,91 @@ static i2c_master_bus_handle_t i2c_bus_setup(void) {
     return bus;
 }
 
-// ---------- VL53L1X bring-up: wake, re-address, and start each sensor ----------
+// ---------- VL53L1X bring-up: wake, re-address, verify, and start each sensor ----------
 // Only one sensor is released from reset (XSHUT high) at a time, so each
 // one is uniquely reachable at the factory-default address (0x29) while
 // it's given its own permanent address.
-static void vl53l1x_bring_up_one(gpio_num_t xshut_pin, uint8_t new_addr) {
-    gpio_set_level(xshut_pin, 1);
-    delay_ms(2); // sensor boot time after leaving reset
 
-    VL53L1X_ERROR status = vl53l1x_platform_set_address(VL53L1X_DEFAULT_ADDR, new_addr);
-    ESP_LOGI(TAG, "0x%02X: set_address status=%d", new_addr, status);
+// Runs one setup call and bails out of the enclosing function with `false`
+// (and a log line saying which call) if it returns a nonzero status.
+#define BRINGUP_STEP(call, name)                                                   \
+    do {                                                                           \
+        status = (call);                                                           \
+        if (status != 0) {                                                         \
+            ESP_LOGE(TAG, "0x%02X: %s failed, status=%d", new_addr, name, status); \
+            return false;                                                          \
+        }                                                                          \
+    } while (0)
+
+static bool vl53l1x_bring_up_once(gpio_num_t xshut_pin, uint8_t new_addr) {
+    VL53L1X_ERROR status;
+
+    // Always start from a clean reset so a half-initialised sensor from a
+    // previous failed attempt is back at the factory-default address.
+    gpio_set_level(xshut_pin, 0);
+    delay_ms(10);
+    gpio_set_level(xshut_pin, 1);
+
+    // Wait for the sensor firmware to finish booting (instead of a fixed delay).
+    uint8_t booted = 0;
+    uint32_t t0 = micros();
+    while (!booted) {
+        VL53L1X_BootState(VL53L1X_DEFAULT_ADDR, &booted);
+        if (booted) break;
+        if (micros() - t0 > (uint32_t)VL53L1X_BOOT_TIMEOUT_MS * 1000UL) {
+            ESP_LOGE(TAG, "0x%02X: sensor did not boot within %u ms", new_addr, (unsigned)VL53L1X_BOOT_TIMEOUT_MS);
+            return false;
+        }
+        delay_ms(2);
+    }
+
+    BRINGUP_STEP(vl53l1x_platform_set_address(VL53L1X_DEFAULT_ADDR, new_addr), "set_address");
     delay_ms(2);
 
-    status = VL53L1X_SensorInit(new_addr);
-    ESP_LOGI(TAG, "0x%02X: SensorInit status=%d", new_addr, status);
+    BRINGUP_STEP(VL53L1X_SensorInit(new_addr), "SensorInit");
+    BRINGUP_STEP(VL53L1X_SetDistanceMode(new_addr, VL53L1X_DISTANCE_MODE_SHORT), "SetDistanceMode");
+    BRINGUP_STEP(VL53L1X_SetTimingBudgetInMs(new_addr, VL53L1X_TIMING_BUDGET_MS), "SetTimingBudgetInMs");
+    BRINGUP_STEP(VL53L1X_SetInterMeasurementInMs(new_addr, VL53L1X_INTER_MEASUREMENT_MS), "SetInterMeasurementInMs");
+    BRINGUP_STEP(VL53L1X_StartRanging(new_addr), "StartRanging");
 
-    status = VL53L1X_SetDistanceMode(new_addr, VL53L1X_DISTANCE_MODE_SHORT);
-    ESP_LOGI(TAG, "0x%02X: SetDistanceMode status=%d", new_addr, status);
+    // Prove the sensor really produces data: wait for its first measurement,
+    // then clear it so continuous ranging carries on.
+    uint8_t ready = 0;
+    t0 = micros();
+    while (!ready) {
+        VL53L1X_CheckForDataReady(new_addr, &ready);
+        if (ready) break;
+        if (micros() - t0 > (uint32_t)VL53L1X_FIRST_RANGE_TIMEOUT_MS * 1000UL) {
+            ESP_LOGE(TAG, "0x%02X: no first measurement within %u ms", new_addr, (unsigned)VL53L1X_FIRST_RANGE_TIMEOUT_MS);
+            return false;
+        }
+        delay_ms(5);
+    }
+    VL53L1X_ClearInterrupt(new_addr);
 
-    status = VL53L1X_SetTimingBudgetInMs(new_addr, VL53L1X_TIMING_BUDGET_MS);
-    ESP_LOGI(TAG, "0x%02X: SetTimingBudgetInMs status=%d", new_addr, status);
-
-    status = VL53L1X_SetInterMeasurementInMs(new_addr, VL53L1X_INTER_MEASUREMENT_MS);
-    ESP_LOGI(TAG, "0x%02X: SetInterMeasurementInMs status=%d", new_addr, status);
-
-    status = VL53L1X_StartRanging(new_addr);
-    ESP_LOGI(TAG, "0x%02X: StartRanging status=%d", new_addr, status);
+    ESP_LOGI(TAG, "0x%02X: sensor ready", new_addr);
+    return true;
 }
 
-static void vl53l1x_bring_up_all(void) {
-    vl53l1x_bring_up_one(PIN_XSHUT_LEFT, VL53L1X_ADDR_LEFT);
-    vl53l1x_bring_up_one(PIN_XSHUT_MID, VL53L1X_ADDR_MID);
-    vl53l1x_bring_up_one(PIN_XSHUT_RIGHT, VL53L1X_ADDR_RIGHT);
+static bool vl53l1x_bring_up_sensor(gpio_num_t xshut_pin, uint8_t new_addr) {
+    for (int attempt = 1; attempt <= VL53L1X_BRINGUP_ATTEMPTS; attempt++) {
+        if (vl53l1x_bring_up_once(xshut_pin, new_addr)) return true;
+        ESP_LOGW(TAG, "0x%02X: bring-up attempt %d/%d failed", new_addr, attempt, VL53L1X_BRINGUP_ATTEMPTS);
+    }
+    // Leave a sensor that will not come up in reset so it can't disturb the bus.
+    gpio_set_level(xshut_pin, 0);
+    return false;
+}
+
+// Returns 0 if all three sensors came up, otherwise 1/2/3 for the FIRST one
+// (left/middle/right) that failed. All three are always attempted so the
+// log shows every failure.
+static uint8_t vl53l1x_bring_up_all(void) {
+    uint8_t first_failed = 0;
+    if (!vl53l1x_bring_up_sensor(PIN_XSHUT_LEFT,  VL53L1X_ADDR_LEFT))  first_failed = 1;
+    if (!vl53l1x_bring_up_sensor(PIN_XSHUT_MID,   VL53L1X_ADDR_MID)  && !first_failed) first_failed = 2;
+    if (!vl53l1x_bring_up_sensor(PIN_XSHUT_RIGHT, VL53L1X_ADDR_RIGHT) && !first_failed) first_failed = 3;
+    return first_failed;
 }
 
 // ---------- LEDC (servo + motor PWM) setup ----------
@@ -379,6 +471,7 @@ static void drive_forward(uint8_t speed) {
         motor_pwm(KICKSTART_SPEED, 0);
         delay_ms(KICKSTART_MS);
         kickstart_needed = 0;
+        sensors_stale = 1; // the sensors were not serviced during the kickstart
     }
     motor_pwm(speed, 0);
 }
@@ -388,6 +481,7 @@ static void drive_reverse(uint8_t speed) {
         motor_pwm(0, KICKSTART_SPEED);
         delay_ms(KICKSTART_MS);
         kickstart_needed = 0;
+        sensors_stale = 1;
     }
     motor_pwm(0, speed);
 }
@@ -401,7 +495,7 @@ static void motor_stop(void) {
 typedef struct {
     uint16_t addr;
     long     last_good_cm;  // last reading that passed the range-status check
-    uint8_t  bad_reads;     // consecutive invalid readings so far
+    uint8_t  bad_reads;     // consecutive invalid readings so far (255 = "no data yet")
     uint16_t raw_mm;        // last raw distance (debug only)
     uint8_t  raw_status;    // last raw range status (debug only; 255 = timed out)
 } Lidar;
@@ -415,6 +509,22 @@ static Lidar lidar_right = { VL53L1X_ADDR_RIGHT, MAX_DISTANCE_CM, 0, 0, 0 };
 static long lidar_bad_read(Lidar *s) {
     if (s->bad_reads < 255) s->bad_reads++;
     return (s->bad_reads <= LIDAR_MAX_BAD_READS) ? s->last_good_cm : (long)MAX_DISTANCE_CM;
+}
+
+// Mark a sensor as having no usable data: it reports "clear" and is not
+// usable for steering until a fresh VALID reading arrives.
+static void lidar_invalidate(Lidar *s) {
+    s->last_good_cm = MAX_DISTANCE_CM;
+    s->bad_reads = 255;
+}
+
+// Steering-grade side reading: the last VALID distance, as long as the sensor
+// has not been invalid for more than LIDAR_SIDE_HOLD_READS reads in a row.
+// Returns 0 (and leaves *cm untouched) if there is no trustworthy value.
+static uint8_t lidar_side_cm(const Lidar *s, long *cm) {
+    if (s->bad_reads > LIDAR_SIDE_HOLD_READS) return 0;
+    *cm = s->last_good_cm;
+    return 1;
 }
 
 // Polls "data ready" on one sensor, checks the range status, converts mm to
@@ -454,6 +564,28 @@ static long read_distance_cm(Lidar *s) {
     return cm;
 }
 
+// After a long block (kickstart, recovery, pause, start-wait) every sensor is
+// still holding a result from BEFORE the delay. Clear it, discard the next
+// measurement too (it may have been partly taken before the clear), and mark
+// the readings "no data yet" so nothing stale is used.
+static void lidar_flush_all(void) {
+    Lidar *all[3] = { &lidar_left, &lidar_mid, &lidar_right };
+
+    for (int i = 0; i < 3; i++) {
+        VL53L1X_ClearInterrupt(all[i]->addr);
+    }
+    for (int i = 0; i < 3; i++) {
+        uint8_t ready = 0;
+        uint32_t t0 = micros();
+        do {
+            VL53L1X_CheckForDataReady(all[i]->addr, &ready);
+            if (ready) break;
+        } while (micros() - t0 < VL53L1X_DATA_READY_TIMEOUT_US);
+        if (ready) VL53L1X_ClearInterrupt(all[i]->addr);
+        lidar_invalidate(all[i]);
+    }
+}
+
 // ---------- small helpers (map / constrain) ----------
 static long constrain_long(long x, long lo, long hi) {
     if (x < lo) return lo;
@@ -475,8 +607,8 @@ static float constrain_float(float x, float lo, float hi) {
 // Error = (right distance) - (left distance), in cm.
 // Positive error => more room on the right => steer right.
 #define STEER_KP  0.2f   // degrees of steering per cm of left/right imbalance
-#define STEER_KI  0.02f  // corrects any steady drift/bias - keep small
-#define STEER_KD  0.01f  // damps oscillation
+#define STEER_KI  0.01f  // corrects any steady drift/bias - keep small
+#define STEER_KD  0.05f  // damps oscillation
 #define STEER_INTEGRAL_LIMIT 150.0f // anti-windup clamp (cm*s)
 
 typedef struct {
@@ -507,7 +639,7 @@ static float pid_update(SteeringPID *pid, float error, float dt) {
 // ---------- Sensor smoothing ----------
 // Exponential filter on the left/right difference for the straight-line
 // PID. Lower alpha = smoother but slower; 1.0 = no filtering.
-#define SENSOR_FILTER_ALPHA 0.3f
+#define SENSOR_FILTER_ALPHA 0.8f
 
 static float filtered_diff = 0.0f;
 static uint8_t filtered_diff_valid = 0;
@@ -536,13 +668,16 @@ static SteeringPID turn_pid = {
 };
 
 // ---------- Per-corner turn direction (not hardcoded, no learning) ----------
-// When a corner starts, the wheels are held straight while (right - left) is
-// summed each loop. The direction locks as soon as |sum| reaches
-// TURN_DECIDE_THRESHOLD_CM, or after TURN_DECIDE_MS at the latest. Positive
-// sum = more room on the right = turn right. Used for that corner only.
-#define TURN_DECIDE_MS            150u  // latest the direction is locked after a corner starts
-#define TURN_DECIDE_THRESHOLD_CM  60L   // lock early once |sum of (right-left)| reaches this
-#define TURN_MIN_STEER_DEG        30u   // minimum steering away from center once locked (0 = PID magnitude only)
+// When a corner starts, (right - left) is summed each loop. Positive sum =
+// more room on the right = turn right. The car steers from the very first
+// loop using the current sign of that sum (provisional), which can still flip
+// while evidence accumulates. The direction LOCKS as soon as |sum| reaches
+// TURN_DECIDE_THRESHOLD_CM, or after TURN_DECIDE_MS at the latest, and is then
+// kept for that corner only.
+#define TURN_DECIDE_MS            200u  // latest the direction is locked after a corner starts
+#define TURN_DECIDE_THRESHOLD_CM  70L   // lock early once |sum of (right-left)| reaches this
+#define TURN_PROVISIONAL_MIN_CM   10L   // below this there is no real evidence yet: wheels stay straight
+#define TURN_MIN_STEER_DEG        20u   // minimum steering away from center once steering (0 = PID magnitude only)
 
 static long    turn_diff_accum = 0;
 static uint8_t turn_decided    = 0;
@@ -590,16 +725,28 @@ static uint8_t stuck_check_and_update(uint32_t now_us, long dist_mid) {
 }
 
 // ---------- Recovery: reverse while wiggling the steering ----------
+// Reverses for REVERSE_TIME_MS IN TOTAL. The clock starts before the
+// kickstart (which therefore counts toward the time), the first wiggle side is
+// applied before the kickstart, and the last wiggle step is shortened to fit.
 static void recover_reverse_and_wiggle(void) {
-    motor_stop();
-    drive_reverse(REVERSE_SPEED);
-
+    const uint32_t total_us = (uint32_t)REVERSE_TIME_MS * 1000UL;
     uint32_t recover_start_us = micros();
-    uint8_t steer_right = 1; // arbitrary starting side
+    uint8_t steer_right = 0; // the side AFTER the first one applied below
 
-    while ((micros() - recover_start_us) < ((uint32_t)REVERSE_TIME_MS * 1000UL)) {
+    set_servo_angle(SERVO_MAX_DEG); // first wiggle side, applied before the kickstart
+
+    motor_stop();
+    drive_reverse(REVERSE_SPEED); // includes the kickstart burst
+
+    while (1) {
+        uint32_t elapsed_us = micros() - recover_start_us;
+        if (elapsed_us >= total_us) break;
+
+        uint32_t remaining_ms = (total_us - elapsed_us) / 1000UL;
+        delay_ms(remaining_ms < WIGGLE_HALF_PERIOD_MS ? remaining_ms : WIGGLE_HALF_PERIOD_MS);
+
+        if ((micros() - recover_start_us) >= total_us) break;
         set_servo_angle(steer_right ? SERVO_MAX_DEG : SERVO_MIN_DEG);
-        delay_ms(WIGGLE_HALF_PERIOD_MS);
         steer_right = !steer_right;
     }
 
@@ -609,6 +756,7 @@ static void recover_reverse_and_wiggle(void) {
 
     reset_steering();
     reset_stuck_detector();
+    sensors_stale = 1; // nothing was read during the reverse
 }
 
 // ---------- Drive state machine ----------
@@ -634,20 +782,43 @@ static void battery_low_warning(void) {
     }
 }
 
+// A sensor would not come up: stay stopped and blink the LED N times per
+// second (1 = left, 2 = middle, 3 = right). Power-cycle to try again.
+static void sensor_failure_halt(uint8_t failed_sensor) {
+    motor_stop();
+    set_servo_angle(SERVO_CENTER_DEG);
+    ESP_LOGE(TAG, "Sensor %u failed to start - not driving. Power-cycle to retry.", (unsigned)failed_sensor);
+
+    while (1) {
+        for (uint8_t i = 0; i < failed_sensor; i++) {
+            gpio_set_level(PIN_LED, 1);
+            delay_ms(200);
+            gpio_set_level(PIN_LED, 0);
+            delay_ms(200);
+        }
+        delay_ms(1000);
+    }
+}
+
 void app_main(void) {
     gpio_setup();
     i2c_bus_setup();
-    vl53l1x_bring_up_all();
+    uint8_t failed_sensor = vl53l1x_bring_up_all();
     ledc_setup();
     adc_setup();
 
     motor_stop();
     set_servo_angle(SERVO_CENTER_DEG);
 
+    if (failed_sensor != 0) {
+        sensor_failure_halt(failed_sensor); // never returns
+    }
+
     while (gpio_get_level(PIN_START_TRIGGER) != 0) {
         delay_ms(20);
         battery_low_warning();
     }
+    sensors_stale = 1; // the wait above may have been long
 
     uint32_t last_pid_us = micros();
     DriveState state = STATE_DRIVE;
@@ -671,7 +842,15 @@ void app_main(void) {
             }
 
             last_pid_us = micros();
+            sensors_stale = 1; // sensors were not read while paused
             continue;
+        }
+
+        // After any long block, drop the stale results before reading.
+        if (sensors_stale) {
+            lidar_flush_all();
+            sensors_stale = 0;
+            last_pid_us = micros();
         }
 
         // No inter-sensor delay needed: I2C sensors have no acoustic cross-talk.
@@ -722,14 +901,24 @@ void app_main(void) {
             float dt = (float)(now - last_pid_us) / 1000000.0f;
             last_pid_us = now;
 
-            long diff = constrain_long(dist_right - dist_left, -(long)MAX_DISTANCE_CM, (long)MAX_DISTANCE_CM);
-            float smoothed_diff = filter_update((float)diff);
-            float offset = pid_update(&steer_pid, smoothed_diff, dt);
+            // Steer from the sides' last VALID readings. If either side has no
+            // trustworthy value (invalid for too long), do not feed the PID a
+            // fake "wide open" gap: go straight and wait for valid data.
+            float offset = 0.0f;
+            long left_cm, right_cm;
+            if (lidar_side_cm(&lidar_left, &left_cm) && lidar_side_cm(&lidar_right, &right_cm)) {
+                long diff = constrain_long(right_cm - left_cm, -(long)MAX_DISTANCE_CM, (long)MAX_DISTANCE_CM);
+                float smoothed_diff = filter_update((float)diff);
+                offset = pid_update(&steer_pid, smoothed_diff, dt);
 
-            int angle = (int)SERVO_CENTER_DEG + (int)offset;
-            if (angle < (int)SERVO_MIN_DEG) angle = (int)SERVO_MIN_DEG;
-            if (angle > (int)SERVO_MAX_DEG) angle = (int)SERVO_MAX_DEG;
-            set_servo_angle((uint8_t)angle);
+                int angle = (int)SERVO_CENTER_DEG + (int)offset;
+                if (angle < (int)SERVO_MIN_DEG) angle = (int)SERVO_MIN_DEG;
+                if (angle > (int)SERVO_MAX_DEG) angle = (int)SERVO_MAX_DEG;
+                set_servo_angle((uint8_t)angle);
+            } else {
+                set_servo_angle(SERVO_CENTER_DEG);
+                reset_steering(); // don't carry a stale integral/filter across the gap
+            }
 
             long steer_amount = (offset < 0.0f) ? (long)(-offset) : (long)offset;
             long turn_speed = (long)DRIVE_SPEED - map_long(
@@ -758,22 +947,21 @@ void app_main(void) {
             long diff = constrain_long(dist_right - dist_left, -(long)MAX_DISTANCE_CM, (long)MAX_DISTANCE_CM);
             float offset = pid_update(&turn_pid, (float)diff, dt);
 
-            // Decide this corner's direction: lock as soon as the evidence
-            // is strong, or after TURN_DECIDE_MS at the latest.
+            // Direction: provisional from the first loop, locked as soon as the
+            // evidence is strong or after TURN_DECIDE_MS at the latest.
             if (!turn_decided) {
                 turn_diff_accum += diff;
                 if (labs(turn_diff_accum) >= TURN_DECIDE_THRESHOLD_CM ||
                     since_turn_start_ms >= TURN_DECIDE_MS) {
                     turn_right = (turn_diff_accum >= 0); // more room on the right -> turn right
                     turn_decided = 1;
+                } else if (labs(turn_diff_accum) >= TURN_PROVISIONAL_MIN_CM) {
+                    turn_right = (turn_diff_accum >= 0); // provisional - may still flip before the lock
                 }
             }
 
-            if (!turn_decided) {
-                // Still gathering evidence: wheels straight, no commitment yet.
-                set_servo_angle(SERVO_CENTER_DEG);
-            } else {
-                // Only the PID's magnitude is used; the sign comes from the lock.
+            if (turn_decided || labs(turn_diff_accum) >= TURN_PROVISIONAL_MIN_CM) {
+                // Only the PID's magnitude is used; the sign comes from the direction above.
                 float magnitude = (offset < 0.0f) ? -offset : offset;
                 if (magnitude < (float)TURN_MIN_STEER_DEG) magnitude = (float)TURN_MIN_STEER_DEG;
                 offset = turn_right ? magnitude : -magnitude;
@@ -782,6 +970,9 @@ void app_main(void) {
                 if (angle < (int)SERVO_MIN_DEG) angle = (int)SERVO_MIN_DEG;
                 if (angle > (int)SERVO_MAX_DEG) angle = (int)SERVO_MAX_DEG;
                 set_servo_angle((uint8_t)angle);
+            } else {
+                // No real evidence yet: wheels straight rather than guess.
+                set_servo_angle(SERVO_CENTER_DEG);
             }
 
             drive_forward(TURN_SPEED);
