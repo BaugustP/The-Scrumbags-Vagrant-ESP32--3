@@ -159,12 +159,12 @@
 // How many consecutive invalid readings from one sensor are covered by
 // holding its last good value, before it is reported as "clear" instead.
 // (Used for the front sensor and for TURN.)
-#define LIDAR_MAX_BAD_READS 2
+#define LIDAR_MAX_BAD_READS 10
 
 // Side sensors, when used for STEERING, keep using their last valid reading
 // for this many invalid reads in a row (about 8 x 25-30 ms = ~200 ms). Past
 // that the steering PID is skipped rather than fed a fake "wide open" side.
-#define LIDAR_SIDE_HOLD_READS 8
+#define LIDAR_SIDE_HOLD_READS 15
 
 // ---------- LEDC (PWM) assignments ----------
 #define LEDC_MODE            LEDC_LOW_SPEED_MODE // only mode available on ESP32-S3
@@ -184,11 +184,11 @@
 
 // ---------- Tuning constants (taken from the working AVR version) ----------
 #define MAX_DISTANCE_CM        150u    // ignore/clamp anything farther than this
-#define STOP_DISTANCE_CM       10u     // genuine imminent collision - stop/reverse
+#define STOP_DISTANCE_CM       5u     // genuine imminent collision - stop/reverse
 #define CORNER_SLOW_DISTANCE_CM 120u    // front wall closer than this -> start slowing
-#define CORNER_TRIGGER_DISTANCE_CM 80u // front wall closer than this -> commit to a TURN
+#define CORNER_TRIGGER_DISTANCE_CM 100u // front wall closer than this -> commit to a TURN
 
-#define TURN_SPEED              70u    // fixed, slow speed while executing a turn
+#define TURN_SPEED              65u    // fixed, slow speed while executing a turn
 #define TURN_DURATION_MS        400u   // how long to hold the turn through a corner - THE main knob to tune
 #define TURN_MAX_EXTRA_MS       200u   // if still blocked after TURN_DURATION_MS, keep turning up to this much longer
 
@@ -201,15 +201,15 @@
 #define SERVO_INVERT      0u // servo direction non-inverted
 
 #define DRIVE_SPEED       100u    // 0-255 forward PWM speed on a clear straight
-#define MIN_SPEED         70u    // speed floor so the car doesn't stall approaching a corner
+#define MIN_SPEED         80u    // speed floor so the car doesn't stall approaching a corner
 #define TURN_SPEED_REDUCTION 50u // max PWM cut for hard PID steering corrections on a straight
-#define REVERSE_SPEED     80u    // 0-255 reverse PWM speed used during recovery
+#define REVERSE_SPEED     100u    // 0-255 reverse PWM speed used during recovery
 
 #define KICKSTART_SPEED    255u
-#define KICKSTART_MS       120u
-#define RECOVERY_SETTLE_MS 100u
+#define KICKSTART_MS       150u
+#define RECOVERY_SETTLE_MS 200u
 
-#define REVERSE_TIME_MS        300u   // TOTAL time spent reversing, kickstart included
+#define REVERSE_TIME_MS        400u   // TOTAL time spent reversing, kickstart included
 #define WIGGLE_HALF_PERIOD_MS  200u
 
 // Stuck: the FRONT sensor must stay within STUCK_DISTANCE_DELTA_CM for this
@@ -676,8 +676,8 @@ static SteeringPID turn_pid = {
 // kept for that corner only.
 #define TURN_DECIDE_MS            200u  // latest the direction is locked after a corner starts
 #define TURN_DECIDE_THRESHOLD_CM  70L   // lock early once |sum of (right-left)| reaches this
-#define TURN_PROVISIONAL_MIN_CM   10L   // below this there is no real evidence yet: wheels stay straight
-#define TURN_MIN_STEER_DEG        20u   // minimum steering away from center once steering (0 = PID magnitude only)
+#define TURN_PROVISIONAL_MIN_CM   20L   // below this there is no real evidence yet: wheels stay straight
+#define TURN_MIN_STEER_DEG        10u   // minimum steering away from center once steering (0 = PID magnitude only)
 
 static long    turn_diff_accum = 0;
 static uint8_t turn_decided    = 0;
@@ -814,7 +814,7 @@ void app_main(void) {
         sensor_failure_halt(failed_sensor); // never returns
     }
 
-    while (gpio_get_level(PIN_START_TRIGGER) != 0) {
+    while (gpio_get_level(PIN_START_TRIGGER) == 0) {
         delay_ms(20);
         battery_low_warning();
     }
@@ -829,7 +829,7 @@ void app_main(void) {
     reset_stuck_detector();
 
     while (1) {
-        if (gpio_get_level(PIN_START_TRIGGER) != 0) {
+        if (gpio_get_level(PIN_START_TRIGGER) == 0) {
             motor_stop();
             set_servo_angle(SERVO_CENTER_DEG);
             reset_steering();
