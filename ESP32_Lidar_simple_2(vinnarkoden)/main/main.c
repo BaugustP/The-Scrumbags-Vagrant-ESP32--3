@@ -2,6 +2,8 @@
   Self-Driving RC Car - SIMPLE version
   ESP-IDF, Arduino Nano ESP32 (ESP32-S3), three VL53L1X lidars on one I2C bus.
 
+  THIS CODE IS AI GENERATED (CLAUDE)
+
   Goal: get around a small walled track (about 4 m, 90-degree corners,
   ~15 cm walls) reliably. No PID, no state machine - one rule every loop:
 
